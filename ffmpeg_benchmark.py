@@ -43,22 +43,40 @@ from pathlib import Path
 # 默认输出目录：脚本所在目录下的 benchmark_results 子目录
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "benchmark_results"
 DEFAULT_PORT = 8080
-DEFAULT_DURATION = 30   # 每项测试的秒数
+DEFAULT_DURATION = 60   # 每项测试的秒数（60s 确保 CPU/内存进入稳态）
+
+# 视频源：加入噪声滤镜，避免编码器优化纯色合成图，更贴近真实负载
+# testsrc2 生成彩色格子图，noise 叠加随机纹理使每帧不可预测
+_VIDEO_SRC = "testsrc2=size={res}:rate=30,noise=alls=20:allf=t+u"
 
 # (name, codec, resolution, preset, extra_ffmpeg_flags)
 TEST_CASES = [
-    ("H.264  1080p  fast",   "libx264", "1920x1080", "fast",         []),
-    ("H.264  1080p  medium", "libx264", "1920x1080", "medium",       []),
-    ("H.264  4K     fast",   "libx264", "3840x2160", "fast",         []),
-    ("H.264  4K     medium", "libx264", "3840x2160", "medium",       []),
-    ("H.265  1080p  fast",   "libx265", "1920x1080", "fast",
+    ("H.264  1080p  fast",        "libx264",    "1920x1080", "fast",   []),
+    ("H.264  1080p  medium",      "libx264",    "1920x1080", "medium", []),
+    ("H.264  4K     fast",        "libx264",    "3840x2160", "fast",   []),
+    ("H.264  4K     medium",      "libx264",    "3840x2160", "medium", []),
+    ("H.264  4K     threads32",   "libx264",    "3840x2160", "fast",   ["-threads", "32"]),
+    ("H.264  4K     threads64",   "libx264",    "3840x2160", "fast",   ["-threads", "64"]),
+    ("H.265  1080p  fast",        "libx265",    "1920x1080", "fast",
      ["-x265-params", "log-level=error"]),
-    ("H.265  1080p  medium", "libx265", "1920x1080", "medium",
+    ("H.265  1080p  medium",      "libx265",    "1920x1080", "medium",
      ["-x265-params", "log-level=error"]),
-    ("H.265  4K     fast",   "libx265", "3840x2160", "fast",
+    ("H.265  4K     fast",        "libx265",    "3840x2160", "fast",
      ["-x265-params", "log-level=error"]),
-    ("VP9    1080p  speed4", "libvpx-vp9", "1920x1080", None,
+    ("H.265  4K     threads32",   "libx265",    "3840x2160", "fast",
+     ["-threads", "32", "-x265-params", "log-level=error:frame-threads=32"]),
+    ("VP9    1080p  speed4",      "libvpx-vp9", "1920x1080", None,
      ["-cpu-used", "4", "-b:v", "0", "-crf", "33"]),
+]
+
+# 并行多实例测试：同时启动 N 个 FFmpeg 进程，合并上报总 FPS
+# (name, n_instances, codec, resolution, preset, extra_ffmpeg_flags)
+PARALLEL_TESTS = [
+    ("H.264  1080p  x2并行", 2, "libx264", "1920x1080", "fast",   []),
+    ("H.264  1080p  x4并行", 4, "libx264", "1920x1080", "fast",   []),
+    ("H.264  4K     x2并行", 2, "libx264", "3840x2160", "fast",   []),
+    ("H.265  1080p  x2并行", 2, "libx265", "1920x1080", "fast",
+     ["-x265-params", "log-level=error"]),
 ]
 
 # Chart.js 调色板（每个 config 一种颜色）
@@ -313,9 +331,10 @@ def run_single_test(name, codec, resolution, preset, extra_args, duration):
         result["status"] = "encoder_not_found"
         return result
 
+    src = _VIDEO_SRC.format(res=resolution)
     cmd = ["ffmpeg", "-y",
            "-f", "lavfi",
-           "-i", f"testsrc2=size={resolution}:rate=30",
+           "-i", src,
            "-t", str(duration),
            "-c:v", codec]
 
@@ -377,6 +396,111 @@ def run_single_test(name, codec, resolution, preset, extra_args, duration):
     return result
 
 
+def run_parallel_test(name, n_instances, codec, resolution, preset, extra_args, duration):
+    """同时启动 n_instances 个 FFmpeg 进程，统计合并 FPS（压内存带宽）。"""
+    result = {
+        "label":      name,
+        "codec":      codec,
+        "resolution": resolution,
+        "preset":     preset,
+        "n_instances": n_instances,
+        "duration_target": duration,
+        "status":     "unknown",
+        "test_type":  "parallel",
+    }
+
+    if not check_encoder(codec):
+        result["status"] = "encoder_not_found"
+        return result
+
+    src = _VIDEO_SRC.format(res=resolution)
+
+    def _make_cmd():
+        c = ["ffmpeg", "-y", "-f", "lavfi", "-i", src,
+             "-t", str(duration), "-c:v", codec]
+        if preset:
+            c += ["-preset", preset]
+        if "-b:v" not in extra_args and "-crf" not in extra_args:
+            c += ["-crf", "23"]
+        c += extra_args
+        c += ["-f", "null", "-"]
+        return c
+
+    monitor = SystemMonitor()
+    monitor.start()
+    t0 = time.time()
+
+    procs = []
+    try:
+        for _ in range(n_instances):
+            procs.append(subprocess.Popen(
+                _make_cmd(), stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                text=True
+            ))
+        stderrs = [p.communicate(timeout=duration * 4 + 90)[1] for p in procs]
+        elapsed = time.time() - t0
+
+        result["elapsed"] = round(elapsed, 2)
+        result["return_codes"] = [p.returncode for p in procs]
+
+        total_fps = 0.0
+        per_fps = []
+        for stderr in stderrs:
+            frame_vals = re.findall(r"frame=\s*(\d+)", stderr)
+            frames = int(frame_vals[-1]) if frame_vals else 0
+            fps = round(frames / elapsed, 2) if frames > 0 and elapsed > 0 else 0.0
+            per_fps.append(fps)
+            total_fps += fps
+
+        result["fps_per_instance"] = per_fps
+        result["fps_avg"]  = round(total_fps, 2)   # 合并总 FPS
+        result["fps_each"] = per_fps
+        result["status"]   = "success" if all(c == 0 for c in result["return_codes"]) else "error"
+
+    except subprocess.TimeoutExpired:
+        result["status"]  = "timeout"
+        result["elapsed"] = time.time() - t0
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+    except Exception as e:
+        result["status"]  = "error"
+        result["error"]   = str(e)
+        result["elapsed"] = time.time() - t0
+    finally:
+        monitor.stop()
+        result.update(monitor.get_summary())
+
+    return result
+
+
+def run_mbw_test():
+    """运行 mbw 内存带宽测试，返回结构化结果字典；mbw 不存在时返回 None。"""
+    mbw_path = run_cmd("which mbw 2>/dev/null")
+    if not mbw_path or mbw_path == "N/A":
+        return None
+
+    print("  [mbw] 正在测试内存带宽（约 30s）...", end="", flush=True)
+    raw = run_cmd("mbw -n 5 512 2>/dev/null", timeout=120)
+    print(" 完成")
+
+    result = {"raw": raw, "tests": {}}
+    # 解析 AVG 行: "AVG     Method: MEMCPY   Elapsed: 0.23 s  MiB:   512.00  Copy: 2200.13 MiB/s"
+    for line in raw.splitlines():
+        if "AVG" not in line:
+            continue
+        m_method = re.search(r"Method:\s*(\S+)", line)
+        m_copy   = re.search(r"Copy:\s*([\d.]+)\s*MiB/s", line)
+        if m_method and m_copy:
+            method = m_method.group(1)
+            bw     = float(m_copy.group(1))
+            result["tests"][method] = bw
+
+    return result if result["tests"] else {"raw": raw, "tests": {}}
+
+
 def run_all_tests(label, output_dir, duration, test_indices=None):
     output_dir.mkdir(parents=True, exist_ok=True)
     # 确保目录对当前用户可写（sudo 运行时目录可能被 root 建立）
@@ -389,7 +513,7 @@ def run_all_tests(label, output_dir, duration, test_indices=None):
     print(f"  FFmpeg 性能基准测试  ·  配置标签: {label}")
     print(f"{'═'*62}")
 
-    print("\n[1/3] 收集系统信息...")
+    print("\n[1/4] 收集系统信息...")
     sys_info = {
         "label":        label,
         "timestamp":    datetime.datetime.now().isoformat(),
@@ -411,14 +535,23 @@ def run_all_tests(label, output_dir, duration, test_indices=None):
         print(f"  Channel : {mem['channels_detected']} (自动检测)")
     print(f"  FFmpeg  : {sys_info['ffmpeg'].get('version','?')}")
 
+    # ── mbw 内存带宽（可选）────────────────────────────────────────────
+    print(f"\n[2/4] mbw 内存带宽测试（如未安装则跳过）...")
+    mbw_result = run_mbw_test()
+    if mbw_result is None:
+        print("  ⚠  mbw 未安装，跳过（sudo apt install mbw）")
+    elif mbw_result.get("tests"):
+        for method, bw in mbw_result["tests"].items():
+            print(f"  {method:<10} {bw:>8.1f} MiB/s")
+
     cases = TEST_CASES
     if test_indices:
         cases = [TEST_CASES[i] for i in test_indices if i < len(TEST_CASES)]
 
-    print(f"\n[2/3] 运行 {len(cases)} 项 FFmpeg 测试（每项 {duration}s）...")
+    print(f"\n[3/4] 运行 {len(cases)} 项单实例 FFmpeg 测试（每项 {duration}s）...")
     test_results = []
     for idx, (name, codec, resolution, preset, extra) in enumerate(cases, 1):
-        print(f"  [{idx:2d}/{len(cases)}] {name:<28} ", end="", flush=True)
+        print(f"  [{idx:2d}/{len(cases)}] {name:<34} ", end="", flush=True)
         r = run_single_test(name, codec, resolution, preset, extra, duration)
         test_results.append(r)
         if r["status"] == "success":
@@ -430,13 +563,34 @@ def run_all_tests(label, output_dir, duration, test_indices=None):
         else:
             print(f"✗  {r['status']}")
 
-    print("\n[3/3] 保存结果...")
+    # ── 并行多实例测试 ─────────────────────────────────────────────────
+    parallel_results = []
+    if not test_indices:   # 只在全量测试时运行并行测试
+        print(f"\n[3.5/4] 运行 {len(PARALLEL_TESTS)} 项并行多实例测试（每项 {duration}s）...")
+        for idx, (pname, n_inst, codec, resolution, preset, extra) in enumerate(PARALLEL_TESTS, 1):
+            print(f"  [{idx:2d}/{len(PARALLEL_TESTS)}] {pname:<34} ", end="", flush=True)
+            r = run_parallel_test(pname, n_inst, codec, resolution, preset, extra, duration)
+            parallel_results.append(r)
+            if r["status"] == "success":
+                per = "  |  ".join(f"{f:.0f}" for f in r.get("fps_per_instance", []))
+                print(f"✓  合计 {r.get('fps_avg','?'):>7} fps  |  "
+                      f"各实例: [{per}]  |  CPU {r.get('cpu_avg','?')}%")
+            elif r["status"] == "encoder_not_found":
+                print("⚠  编码器不可用，已跳过")
+            else:
+                print(f"✗  {r['status']}")
+
+    print("\n[4/4] 保存结果...")
     ts         = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_label = re.sub(r"[^\w\-]", "_", label)
     out_file   = output_dir / f"result_{safe_label}_{ts}.json"
     with open(out_file, "w", encoding="utf-8") as f:
-        json.dump({"system_info": sys_info, "test_results": test_results},
-                  f, ensure_ascii=False, indent=2)
+        json.dump({
+            "system_info":      sys_info,
+            "test_results":     test_results,
+            "parallel_results": parallel_results,
+            "mbw_result":       mbw_result,
+        }, f, ensure_ascii=False, indent=2)
     print(f"  ✓ 已保存: {out_file}")
     return out_file
 
@@ -794,6 +948,64 @@ def generate_html_report(output_dir):
             )
         return rows
 
+    def parallel_table_rows(run):
+        plist = run.get("parallel_results", [])
+        if not plist:
+            return "<tr><td colspan='7' style='color:var(--muted)'>无并行测试数据</td></tr>"
+        rows = ""
+        for t in plist:
+            status_class = "ok" if t["status"] == "success" else "err"
+            per = ", ".join(f"{f:.0f}" for f in t.get("fps_per_instance", []))
+            rows += (
+                f"<tr class='{status_class}'>"
+                f"<td>{t['label']}</td>"
+                f"<td>{t.get('n_instances','-')}</td>"
+                f"<td>{t.get('codec','-')}</td>"
+                f"<td>{t.get('resolution','-')}</td>"
+                f"<td>{t.get('fps_avg','-')} <small>fps (合计)</small></td>"
+                f"<td>[{per}]</td>"
+                f"<td>{t.get('cpu_avg','-')}%</td>"
+                f"</tr>"
+            )
+        return rows
+
+    def mbw_table_rows(run):
+        mbw = run.get("mbw_result")
+        if not mbw or not mbw.get("tests"):
+            return "<tr><td colspan='2' style='color:var(--muted)'>未测试（mbw 未安装或已跳过）</td></tr>"
+        rows = ""
+        for method, bw in mbw["tests"].items():
+            rows += (f"<tr><td>{method}</td>"
+                     f"<td>{bw:.1f} MiB/s</td></tr>")
+        return rows
+
+    # ── mbw 对比表（多 channel 配置横向对比）──────────────────────────
+    mbw_has_data = any(r.get("mbw_result", {}) and
+                       r.get("mbw_result", {}).get("tests")
+                       for r in runs)
+    mbw_compare_section = ""
+    if mbw_has_data and len(runs) >= 1:
+        all_mbw_methods = list(dict.fromkeys(
+            m for r in runs
+            for m in (r.get("mbw_result") or {}).get("tests", {}).keys()
+        ))
+        mbw_hdr = ("<tr><th>Method</th>" +
+                   "".join(f"<th>{lbl}</th>" for lbl in config_labels) + "</tr>")
+        mbw_rows_html = ""
+        for method in all_mbw_methods:
+            mbw_rows_html += f"<tr><td>{method}</td>"
+            for r in runs:
+                bw = (r.get("mbw_result") or {}).get("tests", {}).get(method)
+                mbw_rows_html += (f"<td>{bw:.1f} MiB/s</td>"
+                                  if bw is not None else "<td>-</td>")
+            mbw_rows_html += "</tr>"
+        mbw_compare_section = f"""
+        <h4 style="margin:12px 0 6px">内存带宽对比（mbw）</h4>
+        <table class="result-table">
+          {mbw_hdr}
+          {mbw_rows_html}
+        </table>"""
+
     # 每个 run 的系统信息卡片
     config_cards = ""
     for ci, run in enumerate(runs):
@@ -826,6 +1038,12 @@ def generate_html_report(output_dir):
             <tr><th>负载均值</th>   <td>{si['system_state'].get('load_avg','N/A')}</td></tr>
           </table>
 
+          <h4 style="margin:12px 0 6px">内存带宽（mbw）</h4>
+          <table class="result-table">
+            <tr><th>测试方法</th><th>带宽</th></tr>
+            {mbw_table_rows(run)}
+          </table>
+
           <h4 style="margin:12px 0 6px">DIMM 插槽详情</h4>
           <table class="result-table">
             <tr><th>Locator</th><th>Bank</th><th>Size</th>
@@ -833,23 +1051,51 @@ def generate_html_report(output_dir):
             {dimm_rows(run)}
           </table>
 
-          <h4 style="margin:12px 0 6px">测试结果明细</h4>
+          <h4 style="margin:12px 0 6px">单实例测试结果</h4>
           <table class="result-table">
             <tr><th>测试项</th><th>编码器</th><th>分辨率</th>
                 <th>FPS均值</th><th>CPU均值</th><th>速度</th>
                 <th>耗时</th><th>帧数</th><th>状态</th></tr>
             {test_table_rows(run)}
           </table>
+
+          <h4 style="margin:12px 0 6px">并行多实例测试结果</h4>
+          <table class="result-table">
+            <tr><th>测试项</th><th>实例数</th><th>编码器</th><th>分辨率</th>
+                <th>合计 FPS</th><th>各实例 FPS</th><th>CPU均值</th></tr>
+            {parallel_table_rows(run)}
+          </table>
         </div>
         """
 
+    # ── 并行测试汇总图（各配置并行实例合计 FPS 分组柱图）──────────────
+    all_parallel_names = list(dict.fromkeys(
+        t["label"] for r in runs for t in r.get("parallel_results", [])
+    ))
+    chart_parallel_datasets = []
+    for ci, cfg in enumerate(config_labels):
+        run = runs[ci]
+        pmap = {t["label"]: t for t in run.get("parallel_results", [])}
+        vals = [pmap.get(n, {}).get("fps_avg") or 0 for n in all_parallel_names]
+        if any(v > 0 for v in vals):
+            chart_parallel_datasets.append({
+                "label": cfg,
+                "data":  vals,
+                "color": PALETTE[ci % len(PALETTE)],
+            })
+
     # ── 生成 SVG 图表（纯 Python，无外部依赖）──────────────────────
-    svg_chart1 = svg_grouped_bar(chart1_datasets, all_test_names, width=980, height=400)
+    svg_chart1 = svg_grouped_bar(chart1_datasets, all_test_names, width=980, height=420)
     svg_chart2 = svg_bar(
         config_labels, total_fps,
         [PALETTE[i % len(PALETTE)] for i in range(len(config_labels))],
         width=700, height=300
     )
+    svg_chart_parallel = ""
+    if chart_parallel_datasets and all_parallel_names:
+        svg_chart_parallel = svg_grouped_bar(
+            chart_parallel_datasets, all_parallel_names, width=900, height=380
+        )
     svg_chart3 = ""
     if has_comparison:
         svg_chart3 = svg_line(
@@ -999,6 +1245,7 @@ def generate_html_report(output_dir):
   <nav class="nav">
     <a href="#overview">总览</a>
     <a href="#charts">图表</a>
+    {'<a href="#parallel">并行测试</a>' if svg_chart_parallel else ''}
     {'<a href="#compare">对比分析</a>' if has_comparison else ''}
     <a href="#configs">配置详情</a>
   </nav>
@@ -1013,14 +1260,16 @@ def generate_html_report(output_dir):
       {summary_cards_html}
     </div>
     <p style="color:var(--muted);font-size:12px">
-      「总 FPS」= 该配置所有测试项 FPS 之和（横向趋势对比用）。
+      「总 FPS」= 该配置所有单实例测试项 FPS 之和（横向趋势对比用）。
       FPS 由 <b>编码帧数 ÷ 实际耗时</b> 计算，精度高于 FFmpeg 进度行瞬时值。
+      视频源加入随机噪声滤镜，避免编码器优化合成图案，更接近真实负载。
     </p>
+    {mbw_compare_section}
   </section>
 
   <!-- ───── 图表 ───── -->
   <section id="charts">
-    <h2>性能图表</h2>
+    <h2>性能图表 — 单实例测试</h2>
 
     <div class="chart-wrap">
       <h3>各测试项 FPS 对比（每组 = 一个内存 Channel 配置）</h3>
@@ -1028,10 +1277,13 @@ def generate_html_report(output_dir):
     </div>
 
     <div class="chart-wrap">
-      <h3>各配置总 FPS（所有测试项之和）</h3>
+      <h3>各配置总 FPS（所有单实例测试项之和）</h3>
       {svg_chart2}
     </div>
   </section>
+
+  <!-- ───── 并行测试 ───── -->
+  {'<section id="parallel"><h2>并行多实例测试</h2><p style="color:var(--muted);font-size:12px;margin-bottom:12px">同时运行多个 FFmpeg 进程，压测内存带宽。合计 FPS = 所有实例 FPS 之和。</p><div class="chart-wrap"><h3>并行测试合计 FPS（多实例）</h3>' + svg_chart_parallel + '</div></section>' if svg_chart_parallel else ''}
 
   {comparison_section_html}
 
@@ -1282,6 +1534,11 @@ def generate_readme(script_dir: Path):
         for i, (name, codec, res, preset, _) in enumerate(TEST_CASES)
     )
 
+    parallel_list = "\n".join(
+        f"| {pname} | {n_inst} | {codec} | {res} | {preset or 'N/A'} |"
+        for pname, n_inst, codec, res, preset, _ in PARALLEL_TESTS
+    )
+
     content = f"""# FFmpeg 性能基准测试工具
 
 测试服务器在**不同内存 Channel 配置**下的 FFmpeg 编码性能，
@@ -1309,13 +1566,16 @@ scp {script_name} user@<服务器IP>:/home/user/
 # 2. SSH 登录服务器
 ssh user@<服务器IP>
 
-# 3. 运行测试（建议 sudo，用于读取内存 channel 信息）
+# 3. 安装可选依赖（内存带宽测试）
+sudo apt install mbw
+
+# 4. 运行测试（建议 sudo，用于读取内存 channel 信息）
 sudo python3 {script_name} --label "4-channel"
 
-# 4. 在笔记本新开终端，建立 SSH 隧道
+# 5. 在笔记本新开终端，建立 SSH 隧道
 ssh -N -L 8080:<服务器IP>:8080 user@<服务器IP>
 
-# 5. 笔记本浏览器打开
+# 6. 笔记本浏览器打开
 # http://localhost:8080/report.html
 ```
 
@@ -1324,7 +1584,7 @@ ssh -N -L 8080:<服务器IP>:8080 user@<服务器IP>
 ## 内存 Channel 对比测试流程
 
 ```bash
-# 第一次：服务器处于 4-channel 配置
+# 第一次：服务器处于 4-channel 配置（每次约 30~40 分钟）
 sudo python3 {script_name} --label "4-channel"
 
 # 修改 BIOS/拔掉内存后，重启服务器，再次运行：
@@ -1338,26 +1598,48 @@ sudo python3 {script_name} --label "1-channel"
 
 ---
 
+## 测试设计说明
+
+| 测试类型 | 说明 |
+|---------|------|
+| 单实例 | 依次运行 {len(TEST_CASES)} 个测试项，每项 {DEFAULT_DURATION}s，观察各编码器性能 |
+| 高线程数 | 4K 编码时指定 -threads 32/64，最大化 CPU 和内存带宽压力 |
+| 并行多实例 | 同时启动多个 FFmpeg 进程，合并统计总 FPS，真正压测内存带宽瓶颈 |
+| mbw 内存带宽 | 使用 mbw 工具直接测量 MEMCPY/DUMB/MCblock 带宽，作为辅助参考 |
+
+**视频源**：`testsrc2 + noise` 滤镜，加入随机噪声确保每帧不可预测，
+避免编码器利用合成图案优化，使测试更贴近真实视频编码负载。
+
+---
+
 ## 命令行参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--label TEXT` | 无（必填） | 本次测试的配置标签，如 `4-channel` |
-| `--duration N` | `{DEFAULT_DURATION}` | 每项测试持续秒数 |
+| `--duration N` | `{DEFAULT_DURATION}` | 每项测试持续秒数（60s 确保 CPU/内存进入稳态） |
 | `--output-dir PATH` | 脚本目录/benchmark_results | 结果和报告的保存目录 |
 | `--port N` | `{DEFAULT_PORT}` | HTTP 报告服务端口 |
 | `--bind HOST` | `0.0.0.0` | HTTP 服务器监听地址 |
 | `--report-only` | — | 不测试，仅重新生成报告并启动服务器 |
 | `--no-serve` | — | 测试完成后不启动 HTTP 服务器 |
-| `--tests 0,1,2` | 全部 | 只运行指定序号的测试项 |
+| `--tests 0,1,2` | 全部 | 只运行指定序号的测试项（并行测试仅在全量时运行） |
 
 ---
 
-## 测试项列表
+## 单实例测试项列表
 
 | 序号 | 名称 | 编码器 | 分辨率 | Preset |
 |------|------|--------|--------|--------|
 {test_list}
+
+---
+
+## 并行多实例测试项列表
+
+| 名称 | 实例数 | 编码器 | 分辨率 | Preset |
+|------|--------|--------|--------|--------|
+{parallel_list}
 
 ---
 
@@ -1370,6 +1652,8 @@ benchmark_results/          ← 默认输出目录（脚本同级）
 ├── result_2-channel_20250301_140000.json
 └── result_1-channel_20250301_160000.json
 ```
+
+JSON 文件中包含 `test_results`（单实例）、`parallel_results`（并行）、`mbw_result` 三部分。
 
 ---
 
@@ -1396,14 +1680,13 @@ http://localhost:8080/report.html
 
 | 区域 | 内容 | 触发条件 |
 |------|------|---------|
-| 总览 | 各 Channel 配置的总 FPS 对比卡片 | 始终显示 |
-| 图表 · Chart 1 | 分测试项 FPS 分组柱状图（每组 = 一个配置） | 始终显示 |
-| 图表 · Chart 2 | 各配置总 FPS 柱状图 | 始终显示 |
-| **对比分析** | 多配置 FPS 对比表 + 衰减百分比 + 趋势折线图 | **≥ 2 次测试后自动出现** |
-| 配置详情 | CPU / 内存 / DIMM 插槽 / OS / FFmpeg 版本等 | 始终显示 |
-| 测试明细 | 每项的 FPS 均值、CPU 占用、编码速度倍率、帧数 | 始终显示 |
+| 总览 | 各 Channel 配置总 FPS 对比卡片 + mbw 带宽对比表 | 始终显示 |
+| 图表 | 分测试项 FPS 分组柱状图 + 总 FPS 柱状图 | 始终显示 |
+| **并行测试** | 多实例合计 FPS 分组柱状图 | 有并行测试数据时 |
+| **对比分析** | 多配置 FPS 对比表 + 衰减百分比 + 趋势折线图 | **≥ 2 次测试后** |
+| 配置详情 | CPU / 内存 / DIMM / FFmpeg / mbw / 并行结果明细 | 始终显示 |
 
-> **FPS 计算说明**：使用 `编码帧数 ÷ 实际耗时` 计算，比 FFmpeg 进度行的瞬时 `fps=` 更准确。
+> **FPS 计算**：`编码帧数 ÷ 实际耗时`，比 FFmpeg 进度行瞬时值更准确。
 
 ---
 
@@ -1415,6 +1698,7 @@ http://localhost:8080/report.html
   - 绿色 `+x.x%` = 相对基准性能提升
   - 红色 `-x.x%` = 相对基准性能下降
 - **趋势折线图**：直观展示 channel 减少后总 FPS 的变化曲线
+- **mbw 横向对比**：各配置内存带宽一览，与 FPS 变化相互印证
 
 ---
 
@@ -1429,13 +1713,20 @@ http://localhost:8080/report.html
 ffmpeg -encoders 2>/dev/null | grep -E 'libx265|vp9'
 ```
 
+**Q: mbw 不存在？**
+```bash
+sudo apt install mbw    # Ubuntu/Debian
+sudo yum install mbw    # CentOS/RHEL
+```
+
 **Q: 端口被占用？**
 用 `--port 9090` 指定其他端口，脚本也会自动尝试顺延端口。
 
 **Q: 如何只跑部分测试节省时间？**
 ```bash
-sudo python3 {script_name} --label "4-channel" --tests 0,1,4 --duration 15
+sudo python3 {script_name} --label "4-channel" --tests 0,1,4 --duration 30
 ```
+注意：`--tests` 指定子集时不会运行并行测试。
 
 **Q: 对比分析没有出现？**
 需要至少运行两次（使用不同的 `--label`），每次结果保存为独立 JSON 文件后，
